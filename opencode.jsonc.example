@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//plugins": "本地使用：用 file:// URL 直接引用源码入口并传 options，无需复制/发布。注意：OpenCode 只认 posix 绝对路径、相对路径、或 file:// URL；不要把 package 写成 Windows 盘符路径 D:/...（不会被识别为本地路径，会被当成包名而“未加载”）。把本对象合并进目标项目的 opencode.jsonc（或 .opencode/opencode.jsonc）即可。",
+  "plugins": [
+    {
+      "package": "file:///D:/projects/mine/ntfy/src/index.ts",
+      "options": {
+        "server": "https://ntfy.sh",
+        "topic": "opencode-oZ7vgHOxFHMfstgF",
+        "notifyRoot": true,
+        "notifyChildren": true,
+        "notifyFailed": true,
+        "notifyPermission": true,
+        "notifyStarted": false,
+        "notifyRetry": false
+      }
+    }
+  ]
+}

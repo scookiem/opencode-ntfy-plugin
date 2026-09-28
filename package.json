@@ -1,0 +1,37 @@
+{
+  "name": "opencode-ntfy-plugin",
+  "version": "0.1.1",
+  "description": "Send OpenCode V2 session completion notifications to ntfy.",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "selfcheck": "node --experimental-strip-types scripts/selfcheck.ts"
+  },
+  "license": "MIT",
+  "author": "mofapifeng",
+  "repository": "https://github.com/scookiem/ntfy-opencode2.git",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ntfy",
+    "notification"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "^2.0.16"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
