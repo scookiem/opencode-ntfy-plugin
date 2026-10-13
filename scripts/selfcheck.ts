@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import ntfyPlugin, { createBoundedKeyMap, createBoundedKeySet, formDedupKey, parseJsonc, permissionToolKey, reconnectDelayMs, sessionTimeoutValue } from "../src/index.ts"
+import ntfyPlugin, { createBoundedKeyMap, createBoundedKeySet, createBoundedRoundMap, executionEventKey, formDedupKey, parseJsonc, permissionToolKey, reconnectDelayMs, sessionTimeoutValue } from "../src/index.ts"
 
 type Outcome = "succeeded" | "failed" | "interrupted"
 type PluginContext = Parameters<typeof ntfyPlugin.setup>[0]
@@ -15,6 +15,14 @@ const ENV_KEYS = [
   "NTFY_PRIORITY",
   "NTFY_NOTIFY_ROOT",
   "NTFY_NOTIFY_CHILDREN",
+  "NTFY_NOTIFY_STARTED",
+  "NTFY_NOTIFY_IDLE",
+  "NTFY_NOTIFY_SUCCEEDED",
+  "NTFY_NOTIFY_FAILED",
+  "NTFY_NOTIFY_INTERRUPTED",
+  "NTFY_NOTIFY_PERMISSION",
+  "NTFY_NOTIFY_FORM",
+  "NTFY_NOTIFY_RETRY",
   "NTFY_DEBUG",
   "NTFY_SESSION_TIMEOUT_MS",
   "NTFY_CONFIG_FILE",
@@ -32,6 +40,10 @@ interface MockEvent {
   id: string
   type: string
   data: Record<string, unknown>
+  // Durable envelope metadata the real V2 protocol attaches to execution
+  // events ({aggregateID, seq}); the lifecycle dedup prefers it over the
+  // envelope id, so the mock can exercise both identity paths.
+  durable?: { aggregateID: string; seq: number }
 }
 
 interface CaseOptions {
@@ -45,6 +57,9 @@ interface CaseOptions {
   sessionProjectID?: string
   sessionGetFails?: boolean
   sessionGetHangsFor?: string
+  // Reject every send (network/server down): exercises the send-failure
+  // path — silent by default, debug-only when enabled, never fatal.
+  fetchFails?: boolean
   settleMs?: number
   expectNoProcessError?: boolean
   captureLogs?: boolean
@@ -144,11 +159,15 @@ async function runCase(name: string, options: CaseOptions): Promise<void> {
   }
 
   globalThis.fetch = async (input, init) => {
-    calls.push({
+    const call: FetchCall = {
       url: String(input),
       headers: headersToObject(init?.headers),
       body: typeof init?.body === "string" ? init.body : String(init?.body ?? ""),
-    })
+    }
+    // Record the attempt even when it fails: the plugin must have tried
+    // exactly once per notification, then swallowed the rejection.
+    calls.push(call)
+    if (options.fetchFails) throw new Error("mock network unreachable")
     return new Response("", { status: 200 })
   }
 
@@ -224,7 +243,7 @@ async function runCase(name: string, options: CaseOptions): Promise<void> {
     if (options.assertErrors) options.assertErrors(consoleErrors)
     if (options.expectNoProcessError) {
       assert.equal(
-        consoleErrors.some((line) => line.includes("Failed to process event")),
+        consoleErrors.some((line) => line.includes("Failed to process event") || line.startsWith("[ntfy]")),
         false,
         "timeouts must skip events at debug level, not log process errors",
       )
@@ -395,6 +414,52 @@ async function main(): Promise<void> {
     console.log("PASS request → tool-call map deletes on reply and evicts at the cap")
   }
 
+  // --- Unit: execution event identity prefers durable seq -----------------
+  {
+    assert.equal(
+      executionEventKey({ id: "evt_1", durable: { aggregateID: "ses_1", seq: 7 } }),
+      "ses_1:7",
+      "durable identity (aggregateID:seq) wins over the envelope id",
+    )
+    assert.equal(
+      executionEventKey({ id: "evt_1", durable: { aggregateID: "ses_1", seq: 8 } }),
+      "ses_1:8",
+      "a different seq is a different lifecycle event",
+    )
+    assert.equal(executionEventKey({ id: "evt_1" }), "evt_1", "no durable metadata → envelope id")
+    assert.equal(executionEventKey({ durable: { aggregateID: "ses_1" } }), undefined, "no seq and no id → no identity")
+    assert.equal(
+      executionEventKey({ id: "evt_1", durable: { aggregateID: "  ", seq: 3 } }),
+      "evt_1",
+      "blank aggregateID falls back to the envelope id",
+    )
+    assert.equal(
+      executionEventKey({ id: "evt_1", durable: { aggregateID: "ses_1", seq: Number.NaN } }),
+      "evt_1",
+      "non-finite seq falls back to the envelope id",
+    )
+    console.log("PASS execution event key prefers durable identity with envelope-id fallback")
+  }
+
+  // --- Unit: per-session execution round map ------------------------------
+  {
+    const rounds = createBoundedRoundMap()
+    const first = rounds.ensure("ses_1")
+    assert.equal(rounds.get("ses_1"), first, "ensure returns the stored entry")
+    assert.equal(rounds.get("ses_missing"), undefined, "unknown session has no round")
+    first.startedKey = "ses_1:1"
+    first.terminalNotified = true
+    assert.equal(rounds.ensure("ses_1").startedKey, "ses_1:1", "mutations persist through ensure")
+    assert.equal(rounds.ensure("ses_1").terminalNotified, true, "round state is shared by reference")
+    rounds.ensure("ses_2")
+    assert.equal(rounds.size, 2)
+    for (let index = 3; index <= 21; index += 1) rounds.ensure(`ses_${index}`)
+    assert.equal(rounds.size, 20, "round map must cap at DEDUP_ENTRY_LIMIT")
+    assert.equal(rounds.get("ses_1"), undefined, "oldest session round must be evicted at the cap")
+    assert.notEqual(rounds.get("ses_2"), undefined, "recent sessions must survive")
+    console.log("PASS execution round map stores per-session lifecycle and evicts oldest")
+  }
+
   // --- Unit: session timeout resolution + clamping (risk 3) ------------
   {
     assert.equal(sessionTimeoutValue(undefined), 5_000, "missing → default")
@@ -477,8 +542,28 @@ async function main(): Promise<void> {
   await runCase("missing topic", {
     options: {},
     outcome: "succeeded",
+    captureLogs: true,
     assertCalls(calls) {
       assert.equal(calls.length, 0)
+    },
+    assertLogs(logs) {
+      assert.equal(logs.length, 0, "a missing topic must be completely silent with debug off")
+    },
+  })
+
+  await runCase("missing topic is observable at debug level", {
+    options: { debug: true },
+    outcome: "succeeded",
+    captureLogs: true,
+    assertCalls(calls) {
+      assert.equal(calls.length, 0)
+    },
+    assertLogs(logs) {
+      assert.equal(
+        logs.filter((line) => line.includes("[ntfy-debug] setup.no-topic")).length,
+        1,
+        "the no-topic diagnostic must be visible exactly once with debug on",
+      )
     },
   })
 
@@ -765,6 +850,465 @@ async function main(): Promise<void> {
     },
   })
 
+  // (d) form.created finally has its own switch: notifyForm=false must
+  // suppress the send entirely (and must not consume a dedup slot).
+  await runCase("form disabled", {
+    options: { topic: "mock-topic", notifyForm: false },
+    outcome: "succeeded",
+    events: [{
+      id: "evt_form_disabled",
+      type: "form.created",
+      data: {
+        form: { id: "frm_disabled_1", sessionID: "ses_xxx", title: "关闭开关的表单", fields: [{ type: "string", key: "why", title: "原因" }] },
+      },
+    }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "notifyForm=false must suppress form notifications")
+    },
+  })
+
+  // (e) Success has its own switch, shared by execution.succeeded and the
+  // succeeded outcome of session.idle (dedup keeps them at one anyway).
+  await runCase("succeeded disabled suppresses execution.succeeded and idle success", {
+    options: { topic: "mock-topic", notifySucceeded: false },
+    outcome: "succeeded",
+    events: [
+      { id: "evt_succeeded_off", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_idle_succeeded_off", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "notifySucceeded=false must suppress both success signals")
+    },
+  })
+
+  // (f) Interrupted is its own switch and its own dedup record: repeated
+  // idle events notify once.
+  await runCase("interrupted notifies once", {
+    options: { topic: "mock-topic" },
+    outcome: "interrupted",
+    events: [
+      { id: "evt_interrupted_a", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_interrupted_b", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "repeated idle interruptions must notify once")
+      assert.equal(calls[0].headers.tags, "information_source")
+      assert.equal(calls[0].headers.priority, "4")
+      assert.match(calls[0].headers.title, /\[opencode\] 主任务·已中断/)
+    },
+  })
+
+  await runCase("interrupted disabled", {
+    options: { topic: "mock-topic", notifyInterrupted: false },
+    outcome: "interrupted",
+    events: [{ id: "evt_interrupted_off", type: "session.idle", data: { sessionID: "ses_xxx" } }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "notifyInterrupted=false must suppress interruption notifications")
+    },
+  })
+
+  // (g) Failure and interruption are mutually abnormal terminal states:
+  // whichever signal arrives first notifies, the other is suppressed.
+  await runCase("execution failed suppresses a later idle interruption", {
+    options: { topic: "mock-topic" },
+    outcome: "interrupted",
+    events: [
+      {
+        id: "evt_failed_before_interrupted",
+        type: "session.execution.failed",
+        data: { sessionID: "ses_xxx", error: { type: "ProviderError", message: "mock execution failed" } },
+      },
+      { id: "evt_interrupted_after_failed", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "a failure already notified covers the terminal state")
+      assert.equal(calls[0].headers.tags, "x")
+    },
+  })
+
+  await runCase("idle interruption suppresses a later execution failed", {
+    options: { topic: "mock-topic" },
+    outcome: "interrupted",
+    events: [
+      { id: "evt_interrupted_before_failed", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      {
+        id: "evt_failed_after_interrupted",
+        type: "session.execution.failed",
+        data: { sessionID: "ses_xxx", error: { type: "ProviderError", message: "mock execution failed" } },
+      },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "an interruption already notified covers the terminal state")
+      assert.equal(calls[0].headers.tags, "information_source")
+    },
+  })
+
+  // (h) The new switches also honor the env layer (NTFY_* style).
+  // --- notifyIdle: the session.idle master gate ---------------------------
+  // Off ⇒ session.idle never notifies (no IO, no dedup consumed), while
+  // execution.* events, permissions and forms are unaffected.
+  await runCase("idle disabled suppresses idle notifications", {
+    options: { topic: "mock-topic", notifyIdle: false },
+    outcome: "succeeded",
+    events: [{ id: "evt_idle_off", type: "session.idle", data: { sessionID: "ses_xxx" } }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "notifyIdle=false must suppress idle notifications")
+    },
+  })
+
+  await runCase("idle disabled still notifies execution completion", {
+    options: { topic: "mock-topic", notifyIdle: false },
+    outcome: "succeeded",
+    settleMs: 50,
+    events: [
+      { id: "evt_idle_off_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_idle_off_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_idle_off_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "execution completion must survive notifyIdle=false")
+      assert.equal(calls[0].headers.tags, "white_check_mark")
+    },
+  })
+
+  await runCase("idle disabled still notifies execution failure", {
+    options: { topic: "mock-topic", notifyIdle: false },
+    outcome: "failed",
+    events: [
+      {
+        id: "evt_idle_off_failed",
+        type: "session.execution.failed",
+        data: { sessionID: "ses_xxx", error: { type: "ProviderError", message: "mock execution failed" } },
+      },
+      { id: "evt_idle_off_idle_failed", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "execution failure must survive notifyIdle=false")
+      assert.equal(calls[0].headers.tags, "x")
+    },
+  })
+
+  await runCase("idle disabled still notifies explicit execution interruption", {
+    options: { topic: "mock-topic", notifyIdle: false },
+    outcome: "interrupted",
+    events: [
+      { id: "evt_idle_off_interrupted", type: "session.execution.interrupted", data: { sessionID: "ses_xxx", reason: "user" } },
+      { id: "evt_idle_off_idle_interrupted", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "execution interruption must survive notifyIdle=false and merge with idle")
+      assert.equal(calls[0].headers.tags, "information_source")
+    },
+  })
+
+  await runCase("idle disabled leaves permission and form notifications alone", {
+    options: { topic: "mock-topic", notifyIdle: false },
+    outcome: "succeeded",
+    settleMs: 50,
+    events: [
+      {
+        id: "evt_idle_off_permission",
+        type: "permission.asked",
+        data: { id: "perm_idle_off", sessionID: "ses_xxx", action: "file.write", resources: ["src/index.ts"] },
+      },
+      {
+        id: "evt_idle_off_form",
+        type: "form.created",
+        data: { form: { id: "frm_idle_off", sessionID: "ses_xxx", title: "idle 关闭也应答", fields: [] } },
+      },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "notifyIdle must not gate permission or form notifications")
+      assert.equal(calls[0].headers.tags, "rotating_light")
+      assert.equal(calls[1].headers.tags, "speech_balloon")
+    },
+  })
+
+  // --- session.execution.interrupted (protocol event, not just idle) ------
+  await runCase("execution interrupted notifies with its reason", {
+    options: { topic: "mock-topic" },
+    outcome: "succeeded",
+    events: [{
+      id: "evt_execution_interrupted",
+      type: "session.execution.interrupted",
+      data: { sessionID: "ses_xxx", reason: "user" },
+    }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].headers.tags, "information_source")
+      assert.equal(calls[0].headers.priority, "4")
+      assert.match(calls[0].headers.title, /\[opencode\] 主任务·已中断/)
+      assert.match(calls[0].body, /结果：中断/)
+      assert.match(calls[0].body, /原因：用户中断/)
+    },
+  })
+
+  await runCase("execution interrupted disabled", {
+    options: { topic: "mock-topic", notifyInterrupted: false },
+    outcome: "succeeded",
+    events: [{
+      id: "evt_execution_interrupted_off",
+      type: "session.execution.interrupted",
+      data: { sessionID: "ses_xxx", reason: "shutdown" },
+    }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "notifyInterrupted=false must suppress execution interruptions")
+    },
+  })
+
+  // --- Lifecycle dedup: rounds, not session identity ----------------------
+  // The old sessionID-keyed dedup never reset, so a session's SECOND task
+  // was silently swallowed. Rounds fix that: a new started event reopens
+  // the session, while the same round's idle + completion still merge.
+  await runCase("second round of the same session notifies again", {
+    options: { topic: "mock-topic", notifyStarted: true },
+    outcome: "succeeded",
+    settleMs: 100,
+    events: [
+      { id: "evt_r1_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r1_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r1_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      // 2 started + 2 succeeded; each round's idle merges into its
+      // completion instead of notifying a second time.
+      assert.equal(calls.length, 4, "two rounds must each notify started + completion")
+      assert.equal(calls[0].headers.tags, "arrow_forward")
+      assert.equal(calls[1].headers.tags, "white_check_mark")
+      assert.equal(calls[2].headers.tags, "arrow_forward")
+      assert.equal(calls[3].headers.tags, "white_check_mark")
+    },
+  })
+
+  await runCase("second round notifies even with started disabled", {
+    options: { topic: "mock-topic", notifyStarted: false },
+    outcome: "succeeded",
+    settleMs: 100,
+    events: [
+      { id: "evt_r1b_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r1b_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r1b_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2b_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2b_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_r2b_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "started stays silent but still maintains the lifecycle")
+      assert.equal(calls[0].headers.tags, "white_check_mark")
+      assert.equal(calls[1].headers.tags, "white_check_mark")
+    },
+  })
+
+  await runCase("redelivered started does not reset the notified terminal", {
+    options: { topic: "mock-topic", notifyStarted: false },
+    outcome: "succeeded",
+    settleMs: 100,
+    events: [
+      { id: "evt_re_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_re_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      // Re-delivery of the SAME started event (reconnect redelivery): same
+      // envelope id, so it must not reopen the already-notified round.
+      { id: "evt_re_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_re_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_re_r2_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_re_r2_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "a re-delivered started must not reopen the notified round")
+    },
+  })
+
+  await runCase("redelivered started under a new envelope id but same durable seq does not reset", {
+    options: { topic: "mock-topic", notifyStarted: false },
+    outcome: "succeeded",
+    settleMs: 50,
+    events: [
+      { id: "evt_durable_a", type: "session.execution.started", data: { sessionID: "ses_xxx" }, durable: { aggregateID: "ses_xxx", seq: 1 } },
+      { id: "evt_durable_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      // Same durable identity, different envelope id: still a re-delivery.
+      { id: "evt_durable_b", type: "session.execution.started", data: { sessionID: "ses_xxx" }, durable: { aggregateID: "ses_xxx", seq: 1 } },
+      { id: "evt_durable_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "durable identity must win over the envelope id")
+    },
+  })
+
+  await runCase("started with a new durable seq opens the next round", {
+    options: { topic: "mock-topic", notifyStarted: false },
+    outcome: "succeeded",
+    settleMs: 50,
+    events: [
+      { id: "evt_seq1_started", type: "session.execution.started", data: { sessionID: "ses_xxx" }, durable: { aggregateID: "ses_xxx", seq: 1 } },
+      { id: "evt_seq1_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_seq2_started", type: "session.execution.started", data: { sessionID: "ses_xxx" }, durable: { aggregateID: "ses_xxx", seq: 2 } },
+      { id: "evt_seq2_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "a new durable seq is a new round")
+    },
+  })
+
+  await runCase("rounds are independent per session", {
+    options: { topic: "mock-topic", notifyStarted: false },
+    outcome: "succeeded",
+    settleMs: 100,
+    events: [
+      { id: "evt_multi_a_started", type: "session.execution.started", data: { sessionID: "ses_a" } },
+      { id: "evt_multi_b_started", type: "session.execution.started", data: { sessionID: "ses_b" } },
+      { id: "evt_multi_a_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_a" } },
+      { id: "evt_multi_a_idle", type: "session.idle", data: { sessionID: "ses_a" } },
+      { id: "evt_multi_b_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_b" } },
+      { id: "evt_multi_b_idle", type: "session.idle", data: { sessionID: "ses_b" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "interleaved sessions must not clear each other's rounds")
+    },
+  })
+
+  await runCase("next round may change outcome", {
+    options: { topic: "mock-topic" },
+    outcome: "succeeded",
+    settleMs: 100,
+    events: [
+      { id: "evt_mix_r1_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      { id: "evt_mix_r1_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_mix_r1_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_mix_r2_started", type: "session.execution.started", data: { sessionID: "ses_xxx" } },
+      {
+        id: "evt_mix_r2_failed",
+        type: "session.execution.failed",
+        data: { sessionID: "ses_xxx", error: { type: "ProviderError", message: "mock execution failed" } },
+      },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "round 2's failure must notify even after round 1's success")
+      assert.equal(calls[0].headers.tags, "white_check_mark")
+      assert.equal(calls[1].headers.tags, "x")
+    },
+  })
+
+  // The deterministic inconsistency the round flag fixes: two idle events
+  // of the same round with different outcomes must never double-notify,
+  // in either order.
+  await runCase("idle interruption then idle failure notifies once", {
+    options: { topic: "mock-topic" },
+    outcome: "interrupted",
+    settleMs: 50,
+    events: [
+      { id: "evt_i_then_f_a", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_i_then_f_b", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "one terminal notification per round, whichever signal arrives first")
+      assert.equal(calls[0].headers.tags, "information_source")
+    },
+  })
+
+  await runCase("idle failure then idle interruption notifies once", {
+    options: { topic: "mock-topic" },
+    outcome: "failed",
+    settleMs: 50,
+    events: [
+      { id: "evt_f_then_i_a", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_f_then_i_b", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "one terminal notification per round, whichever signal arrives first")
+      assert.equal(calls[0].headers.tags, "warning")
+    },
+  })
+
+  // --- Orthogonality of the outcome switches -------------------------------
+  await runCase("succeeded disabled does not suppress failure", {
+    options: { topic: "mock-topic", notifySucceeded: false },
+    outcome: "failed",
+    events: [{ id: "evt_orth_failed", type: "session.idle", data: { sessionID: "ses_xxx" } }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "notifySucceeded must not gate failures")
+      assert.equal(calls[0].headers.tags, "warning")
+    },
+  })
+
+  await runCase("failed disabled does not suppress success", {
+    options: { topic: "mock-topic", notifyFailed: false },
+    outcome: "succeeded",
+    events: [{ id: "evt_orth_succeeded", type: "session.idle", data: { sessionID: "ses_xxx" } }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "notifyFailed must not gate successes")
+      assert.equal(calls[0].headers.tags, "white_check_mark")
+    },
+  })
+
+  // A switch-gated skip must not consume the round's terminal state: only a
+  // notification that is actually sent may suppress later signals.
+  await runCase("switch-gated skip does not consume the round", {
+    options: { topic: "mock-topic", notifySucceeded: false },
+    outcome: "failed",
+    settleMs: 50,
+    events: [
+      { id: "evt_noconsume_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_xxx" } },
+      { id: "evt_noconsume_idle_failed", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "the gated success must leave the round open for the failure signal")
+      assert.equal(calls[0].headers.tags, "warning")
+    },
+  })
+
+  // replied/cancelled stay bookkeeping-only even with the form switch off:
+  // the switch must never turn them into notifications.
+  await runCase("form switch off keeps replied bookkeeping inert", {
+    options: { topic: "mock-topic", notifyForm: false },
+    outcome: "succeeded",
+    settleMs: 50,
+    events: [
+      {
+        id: "evt_form_off_created",
+        type: "form.created",
+        data: { form: { id: "frm_off_1", sessionID: "ses_xxx", title: "关闭表单开关", fields: [] } },
+      },
+      { id: "evt_form_off_replied", type: "form.replied", data: { id: "frm_off_1", sessionID: "ses_xxx" } },
+      {
+        id: "evt_form_off_created_again",
+        type: "form.created",
+        data: { form: { id: "frm_off_1", sessionID: "ses_xxx", title: "关闭表单开关", fields: [] } },
+      },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "form notifications stay off; replied never notifies")
+    },
+  })
+
+  await runCase("NTFY_NOTIFY_FORM=false disables form notifications", {
+    options: { topic: "mock-topic" },
+    env: { NTFY_NOTIFY_FORM: "false" },
+    outcome: "succeeded",
+    events: [{
+      id: "evt_form_env_off",
+      type: "form.created",
+      data: {
+        form: { id: "frm_env_off_1", sessionID: "ses_xxx", title: "环境变量关闭的表单", fields: [{ type: "string", key: "why", title: "原因" }] },
+      },
+    }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "NTFY_NOTIFY_FORM=false must reach the config layer")
+    },
+  })
+
+  await runCase("NTFY_NOTIFY_IDLE=false disables idle notifications", {
+    options: { topic: "mock-topic" },
+    env: { NTFY_NOTIFY_IDLE: "false" },
+    outcome: "succeeded",
+    events: [{ id: "evt_idle_env_off", type: "session.idle", data: { sessionID: "ses_xxx" } }],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0, "NTFY_NOTIFY_IDLE=false must reach the config layer")
+    },
+  })
+
   await runCase("permission notifies when session lookup fails", {
     options: { topic: "mock-topic" },
     outcome: "succeeded",
@@ -1039,6 +1583,104 @@ async function main(): Promise<void> {
     },
   })
 
+  // --- Logging contract: silent by default, debug-only diagnostics -------
+  // The happy path with debug unset must produce zero output: no
+  // [ntfy-debug] lines, no [ntfy] error lines.
+  await runCase("default config stays silent on the happy path", {
+    options: { topic: "mock-topic" },
+    outcome: "succeeded",
+    captureLogs: true,
+    assertCalls(calls) {
+      assert.equal(calls.length, 1)
+    },
+    assertLogs(logs) {
+      assert.equal(logs.length, 0, "debug=false must keep the happy path completely silent")
+    },
+  })
+
+  // A failing ntfy endpoint is operational noise: silent by default, the
+  // rejection swallowed, and the subscription loop keeps processing the
+  // next event (two notifications attempted, zero output).
+  await runCase("send failure is silent by default and the loop survives", {
+    options: { topic: "mock-topic" },
+    outcome: "succeeded",
+    fetchFails: true,
+    captureLogs: true,
+    settleMs: 50,
+    events: [
+      { id: "evt_send_fail_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_send_fail_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_other" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2, "both notifications must be attempted despite the failures")
+    },
+    assertLogs(logs) {
+      assert.equal(logs.length, 0, "send failures must not print error lines by default")
+    },
+  })
+
+  // With debug on, the same failure is observable — and only then.
+  await runCase("send failure is observable at debug level", {
+    options: { topic: "mock-topic", debug: true },
+    outcome: "succeeded",
+    fetchFails: true,
+    captureLogs: true,
+    settleMs: 50,
+    events: [
+      { id: "evt_send_fail_debug_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+      { id: "evt_send_fail_debug_succeeded", type: "session.execution.succeeded", data: { sessionID: "ses_other" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 2)
+    },
+    assertLogs(logs) {
+      const sendFailures = logs.filter((line) => line.includes("[ntfy-debug] send.failed"))
+      assert.equal(sendFailures.length, 2, "each failed send must be logged at debug level")
+      assert.equal(
+        logs.some((line) => line.startsWith("[ntfy]")),
+        false,
+        "debug mode must not upgrade diagnostics to error lines",
+      )
+    },
+  })
+
+  // A malformed event (missing data payload) throws inside the handler:
+  // silent by default, debug-observable when enabled, and the loop keeps
+  // processing subsequent events either way.
+  await runCase("malformed event is skipped silently and the loop keeps going", {
+    options: { topic: "mock-topic" },
+    outcome: "succeeded",
+    captureLogs: true,
+    events: [
+      { id: "evt_malformed", type: "session.idle", data: undefined as unknown as Record<string, unknown> },
+      { id: "evt_after_malformed", type: "session.idle", data: { sessionID: "ses_xxx" } },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 1, "the subscription loop must survive a malformed event")
+    },
+    assertLogs(logs) {
+      assert.equal(logs.length, 0, "handler failures are debug-only, never error lines")
+    },
+  })
+
+  await runCase("malformed event is observable at debug level", {
+    options: { topic: "mock-topic", debug: true },
+    outcome: "succeeded",
+    captureLogs: true,
+    events: [
+      { id: "evt_malformed_debug", type: "session.idle", data: undefined as unknown as Record<string, unknown> },
+    ],
+    assertCalls(calls) {
+      assert.equal(calls.length, 0)
+    },
+    assertLogs(logs) {
+      assert.ok(
+        logs.some((line) => line.includes("[ntfy-debug] event.failed type=session.idle")),
+        "a handler failure must be observable with debug on",
+      )
+    },
+  })
+
   // --- Unit: JSONC comment stripping is string-safe ----------------------
   {
     const parsed = parseJsonc(`{
@@ -1113,62 +1755,73 @@ async function main(): Promise<void> {
       },
     })
 
-    // (c) 文件不存在：静默跳过——不报错、不崩溃、无 topic 时不发送。
+    // (c) 文件不存在：静默跳过——debug=false 时零输出，不崩、无 topic 时不发送。
     await runCase("missing config file is skipped silently", {
       options: {},
       env: { NTFY_CONFIG_FILE: join(directory, "absent.json") },
       outcome: "succeeded",
-      captureErrors: true,
+      captureLogs: true,
       assertCalls(calls) {
         assert.equal(calls.length, 0)
       },
-      assertErrors(errors) {
+      assertLogs(logs) {
+        assert.equal(logs.length, 0, "a missing config file must produce zero output with debug off")
+      },
+    })
+
+    // (d) 非法 JSON：debug 开启时可见一条解析失败诊断，回退环境变量继续工作。
+    const brokenFile = join(directory, "broken.json")
+    writeFileSync(brokenFile, "{ this is not json", "utf-8")
+    await runCase("invalid config file is debug-visible and falls back to env", {
+      options: { debug: true },
+      env: { NTFY_CONFIG_FILE: brokenFile, NTFY_TOPIC: "env-fallback-topic" },
+      outcome: "succeeded",
+      captureLogs: true,
+      assertCalls(calls) {
+        assert.equal(calls.length, 1)
+        assert.equal(calls[0].url.endsWith("/env-fallback-topic"), true)
+      },
+      assertLogs(logs) {
         assert.equal(
-          errors.some((line) => line.toLowerCase().includes("config file")),
-          false,
-          "a missing config file must not produce an error line",
+          logs.filter((line) => line.includes("[ntfy-debug] config.file parse failed")).length,
+          1,
+          "exactly one parse-failure diagnostic, and the plugin stays alive",
         )
       },
     })
 
-    // (d) 非法 JSON：只记一条 error，不崩，回退到环境变量继续工作。
-    const brokenFile = join(directory, "broken.json")
-    writeFileSync(brokenFile, "{ this is not json", "utf-8")
-    await runCase("invalid config file logs one error and falls back to env", {
+    // (d) debug=false：同一故障零输出，行为不变（仍回退环境变量）。
+    await runCase("invalid config file is silent with debug off", {
       options: {},
       env: { NTFY_CONFIG_FILE: brokenFile, NTFY_TOPIC: "env-fallback-topic" },
       outcome: "succeeded",
-      captureErrors: true,
+      captureLogs: true,
       assertCalls(calls) {
         assert.equal(calls.length, 1)
         assert.equal(calls[0].url.endsWith("/env-fallback-topic"), true)
       },
-      assertErrors(errors) {
-        assert.equal(
-          errors.filter((line) => line.includes("[ntfy] Failed to parse config file")).length,
-          1,
-          "exactly one parse-failure line, and the plugin stays alive",
-        )
+      assertLogs(logs) {
+        assert.equal(logs.length, 0, "a parse failure must not print anything with debug off")
       },
     })
 
-    // (d) 合法 JSON 但不是对象：同样记一条 error 并回退。
+    // (d) 合法 JSON 但不是对象：同样只留一条 debug 诊断并回退。
     const arrayFile = join(directory, "array.json")
     writeFileSync(arrayFile, "[1, 2, 3]", "utf-8")
-    await runCase("non-object config file logs one error and falls back", {
-      options: {},
+    await runCase("non-object config file is debug-visible and falls back", {
+      options: { debug: true },
       env: { NTFY_CONFIG_FILE: arrayFile, NTFY_TOPIC: "env-fallback-topic" },
       outcome: "succeeded",
-      captureErrors: true,
+      captureLogs: true,
       assertCalls(calls) {
         assert.equal(calls.length, 1)
         assert.equal(calls[0].url.endsWith("/env-fallback-topic"), true)
       },
-      assertErrors(errors) {
+      assertLogs(logs) {
         assert.equal(
-          errors.filter((line) => line.includes("[ntfy] Config file must contain a JSON object")).length,
+          logs.filter((line) => line.includes("[ntfy-debug] config.file not an object")).length,
           1,
-          "a JSON array is not a config object: one error line, still no crash",
+          "a JSON array is not a config object: one debug diagnostic, still no crash",
         )
       },
     })
@@ -1204,7 +1857,8 @@ async function main(): Promise<void> {
       },
     })
 
-    // debug 开关也可以来自外部文件。
+    // debug 开关也可以来自外部文件；启动阶段诊断经缓冲回放，因此文件里的
+    // debug=true 同样能看到配置加载日志。
     const debugFile = join(directory, "debug.json")
     writeFileSync(debugFile, JSON.stringify({ topic: "debug-file-topic", debug: true }), "utf-8")
     await runCase("debug flag can come from the config file", {
@@ -1217,6 +1871,31 @@ async function main(): Promise<void> {
       },
       assertLogs(logs) {
         assert.equal(logs.some((line) => line.includes("[ntfy-debug] setup")), true, "file-provided debug must enable diagnostics")
+        assert.equal(
+          logs.some((line) => line.includes("[ntfy-debug] config.file loaded")),
+          true,
+          "bootstrap diagnostics must be replayed so config loading is visible",
+        )
+      },
+    })
+
+    // 新增的 hook 开关同样走文件白名单与分层读取。
+    const switchFile = join(directory, "switches.json")
+    writeFileSync(switchFile, JSON.stringify({ topic: "switch-file-topic", notifyIdle: false, notifySucceeded: false, notifyForm: false }), "utf-8")
+    await runCase("config file can disable the new hook switches", {
+      options: {},
+      env: { NTFY_CONFIG_FILE: switchFile },
+      outcome: "succeeded",
+      events: [
+        { id: "evt_switch_file_idle", type: "session.idle", data: { sessionID: "ses_xxx" } },
+        {
+          id: "evt_switch_file_form",
+          type: "form.created",
+          data: { form: { id: "frm_switch_file", sessionID: "ses_xxx", title: "文件层关闭", fields: [] } },
+        },
+      ],
+      assertCalls(calls) {
+        assert.equal(calls.length, 0, "file-provided notifyIdle/notifySucceeded/notifyForm=false must apply")
       },
     })
   })
@@ -1254,8 +1933,9 @@ async function main(): Promise<void> {
       assert.ok(created.includes("//"), "自动创建的模板必须带注释")
       for (const key of [
         "server", "topic", "token", "tag",
-        "notifyRoot", "notifyChildren", "notifyStarted",
-        "notifyFailed", "notifyPermission", "notifyRetry",
+        "notifyRoot", "notifyChildren", "notifyStarted", "notifyIdle",
+        "notifySucceeded", "notifyFailed", "notifyInterrupted",
+        "notifyPermission", "notifyForm", "notifyRetry",
         "debug", "sessionTimeoutMs",
       ]) {
         assert.ok(created.includes(`"${key}"`), `模板必须包含 ${key} 字段`)
@@ -1263,6 +1943,12 @@ async function main(): Promise<void> {
       const parsedTemplate = parseJsonc(created) as Record<string, unknown>
       assert.equal(parsedTemplate.topic, "", "topic 默认留空占位，由用户填写")
       assert.equal(parsedTemplate.server, "https://ntfy.sh", "模板 server 保留内置默认值")
+      // 新增开关的模板取值必须等于内置默认值，保证首次创建的模板不改变
+      // 任何通知行为。
+      assert.equal(parsedTemplate.notifyIdle, true, "模板 notifyIdle 保留默认 true")
+      assert.equal(parsedTemplate.notifySucceeded, true, "模板 notifySucceeded 保留默认 true")
+      assert.equal(parsedTemplate.notifyInterrupted, true, "模板 notifyInterrupted 保留默认 true")
+      assert.equal(parsedTemplate.notifyForm, true, "模板 notifyForm 保留默认 true")
 
       // 模板可读：用户自行填入 topic 后（对既有文件的用户编辑，非覆盖），
       // 插件按默认单一路径读取并生效。
@@ -1316,16 +2002,16 @@ async function main(): Promise<void> {
       writeFileSync(legacyFile, legacyContent, "utf-8")
 
       await runCase("legacy ntfy.local.json triggers a rename hint, nothing else", {
-        options: {},
+        options: { debug: true },
         env: { NTFY_CONFIG_FILE: undefined, HOME: home, USERPROFILE: home },
         outcome: "succeeded",
-        captureErrors: true,
+        captureLogs: true,
         assertCalls(calls) {
           assert.equal(calls.length, 0, "旧文件名不在读取范围内")
         },
-        assertErrors(errors) {
+        assertLogs(logs) {
           assert.equal(
-            errors.filter((line) => line.includes("legacy config file")).length,
+            logs.filter((line) => line.includes("[ntfy-debug] config.file legacy rename hint")).length,
             1,
             "必须提示用户改名，而不是静默忽略旧文件",
           )
@@ -1372,21 +2058,36 @@ async function main(): Promise<void> {
     // 用一个"文件"霸占默认目录位置：mkdir recursive 必然失败。
     writeFileSync(join(home, ".config", "opencode"), "not a directory", "utf-8")
 
-    await runCase("unwritable default config path logs one error and keeps running", {
-      options: { topic: "inline-topic" },
+    await runCase("unwritable default config path is debug-visible and keeps running", {
+      options: { topic: "inline-topic", debug: true },
       env: { NTFY_CONFIG_FILE: undefined, HOME: home, USERPROFILE: home },
       outcome: "succeeded",
-      captureErrors: true,
+      captureLogs: true,
       assertCalls(calls) {
         assert.equal(calls.length, 1)
         assert.equal(calls[0].url.endsWith("/inline-topic"), true)
       },
-      assertErrors(errors) {
+      assertLogs(logs) {
         assert.equal(
-          errors.filter((line) => line.includes("Failed to create default config file")).length,
+          logs.filter((line) => line.includes("[ntfy-debug] config.file create failed")).length,
           1,
-          "创建失败必须只记一条错误，插件继续工作",
+          "创建失败必须只留一条诊断，插件继续工作",
         )
+      },
+    })
+
+    // debug=false：不可写路径零输出，行为不变。
+    await runCase("unwritable default config path is silent with debug off", {
+      options: { topic: "inline-topic" },
+      env: { NTFY_CONFIG_FILE: undefined, HOME: home, USERPROFILE: home },
+      outcome: "succeeded",
+      captureLogs: true,
+      assertCalls(calls) {
+        assert.equal(calls.length, 1)
+        assert.equal(calls[0].url.endsWith("/inline-topic"), true)
+      },
+      assertLogs(logs) {
+        assert.equal(logs.length, 0, "an unwritable config path must not print anything with debug off")
       },
     })
   })

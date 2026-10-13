@@ -60,8 +60,12 @@ interface Config {
   notifyRoot: boolean
   notifyChildren: boolean
   notifyStarted: boolean
+  notifyIdle: boolean
+  notifySucceeded: boolean
   notifyFailed: boolean
+  notifyInterrupted: boolean
   notifyPermission: boolean
+  notifyForm: boolean
   notifyRetry: boolean
   debug: boolean
   sessionTimeoutMs: number
@@ -143,8 +147,12 @@ const CONFIG_FILE_KEYS = [
   "notifyRoot",
   "notifyChildren",
   "notifyStarted",
+  "notifyIdle",
+  "notifySucceeded",
   "notifyFailed",
+  "notifyInterrupted",
   "notifyPermission",
+  "notifyForm",
   "notifyRetry",
   "debug",
   "sessionTimeoutMs",
@@ -177,6 +185,7 @@ const NOTIFIED_EVENT_TYPES: ReadonlySet<string> = new Set([
   "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
+  "session.execution.interrupted",
   "permission.asked",
   "permission.replied",
   "form.created",
@@ -187,8 +196,14 @@ const NOTIFIED_EVENT_TYPES: ReadonlySet<string> = new Set([
   "session.retry.scheduled",
 ])
 
-// Diagnostics are opt-in via options.debug / NTFY_DEBUG. Unconditional
-// per-event logging floods the host log and amplifies stderr I/O.
+// Logging policy (single tier): EVERY plugin log line is a debug
+// diagnostic. With debug=false the plugin is completely silent — no
+// topic, legacy file hints, config read/parse failures and template
+// write failures are diagnostics too, because an unconditional line per
+// setup still reaches the host log on every load and a broken host
+// console must never turn a log call into a plugin failure. With
+// debug=true the [ntfy-debug] stream covers config loading, event
+// filtering/skips, send failures, event-handler failures and reconnects.
 // The flag is captured per setup() call: a module-level variable would let
 // one instance's debug setting overwrite another's (multi-project hosts,
 // hot reloads). Module scope holds pure, stateless code only.
@@ -202,6 +217,37 @@ function createDebugLogger(enabled: boolean): DebugLogger {
     } catch {
       // Diagnostics must never affect plugin behavior.
     }
+  }
+}
+
+// The final debug flag is only known AFTER the external config file is
+// read, but the file reader itself needs a logger (a file-provided
+// debug=true must still show config loading). Bootstrap diagnostics are
+// therefore buffered — bounded, oldest-first — and replayed through the
+// final logger once config.debug is resolved. The buffer is not a second
+// source of truth: it never prints on its own, and with debug=false
+// everywhere it is simply discarded, so the plugin stays silent. Debug
+// resolution itself keeps the normal priority options > env > file >
+// default (see readConfig), so options.debug=false wins over a file's
+// true — the buffer does not change that.
+const BOOTSTRAP_LOG_LIMIT = 50
+
+interface BootstrapLogger {
+  log: DebugLogger
+  replay(log: DebugLogger): void
+}
+
+function createBootstrapLogger(): BootstrapLogger {
+  const buffer: string[] = []
+  return {
+    log: (message: string): void => {
+      if (buffer.length >= BOOTSTRAP_LOG_LIMIT) buffer.shift()
+      buffer.push(message)
+    },
+    replay: (log: DebugLogger): void => {
+      const pending = buffer.splice(0, buffer.length)
+      for (const message of pending) log(message)
+    },
   }
 }
 
@@ -325,6 +371,69 @@ export function createBoundedKeyMap(): BoundedKeyMap {
     delete: (key: string): boolean => entries.delete(key),
     get size(): number { return entries.size },
   }
+}
+
+// Per-session execution-round state — the lifecycle dedup that replaces
+// the old sessionID-keyed notified sets (which never reset and therefore
+// swallowed every notification after the first round of a session):
+//   - startedKey: identity of the started event that opened the current
+//     round. A re-delivered started event (same durable identity) must NOT
+//     reopen a round whose terminal was already notified.
+//   - terminalNotified: whether this round already produced a terminal
+//     notification. It merges the round's idle + execution completion
+//     signals into one notification and is only ever set when a
+//     notification is actually sent (never consumed by a skipped event).
+// One entry per session, same cap and oldest-first eviction as the other
+// bounded stores; eviction merely makes that session's next round look
+// unopened (one extra notification at worst). Exported for self-tests.
+interface SessionRound {
+  startedKey?: string
+  terminalNotified?: boolean
+}
+
+interface BoundedRoundMap {
+  get(sessionID: string): SessionRound | undefined
+  ensure(sessionID: string): SessionRound
+  readonly size: number
+}
+
+export function createBoundedRoundMap(): BoundedRoundMap {
+  const entries = new Map<string, SessionRound>()
+  return {
+    get: (sessionID: string): SessionRound | undefined => entries.get(sessionID),
+    ensure: (sessionID: string): SessionRound => {
+      const existing = entries.get(sessionID)
+      if (existing !== undefined) return existing // never refreshes LRU age
+      const created: SessionRound = {}
+      entries.set(sessionID, created)
+      if (entries.size > DEDUP_ENTRY_LIMIT) {
+        const oldest = entries.keys().next()
+        if (!oldest.done) entries.delete(oldest.value)
+      }
+      return created
+    },
+    get size(): number { return entries.size },
+  }
+}
+
+// Stable identity of an execution-lifecycle event, per the local V2
+// protocol (@opencode/client generated types): durable events carry
+// { aggregateID, seq }, and that pair survives transport redelivery even
+// when the envelope id differs, so it is preferred. Events without durable
+// metadata (session.idle, permission.*, form.*) or with a blank/non-finite
+// seq fall back to the envelope id; a completely unidentified event yields
+// undefined so callers can stay conservative. Pure and exported for
+// self-tests; never returns an empty key.
+export function executionEventKey(event: {
+  id?: string
+  durable?: { aggregateID?: string; seq?: number }
+}): string | undefined {
+  const aggregateID = stringValue(event.durable?.aggregateID)
+  const seq = event.durable?.seq
+  if (aggregateID !== undefined && typeof seq === "number" && Number.isFinite(seq)) {
+    return `${aggregateID}:${seq}`
+  }
+  return stringValue(event.id)
 }
 
 // A permission.asked carries two identities: permission.id names one request
@@ -509,7 +618,8 @@ const DEFAULT_CONFIG_FILE_TEMPLATE = `{
   // topic：必填。通知发送到哪个 ntfy topic。
   //   公共 ntfy.sh 上 topic 名相当于"密码"，请使用足够长、难猜测的
   //   名字（如 my-opencode-alerts-8f3k2j），避免无关人员也能收到。
-  //   留空则插件不发送任何通知（启动时会给出告警）。
+  //   留空则插件不发送任何通知：仅 debug=true 时记录一条诊断日志，
+  //   否则完全静默。
   "topic": "",
 
   // token：可选。ntfy 访问令牌，用于私有/受保护的 topic，
@@ -534,19 +644,41 @@ const DEFAULT_CONFIG_FILE_TEMPLATE = `{
   "notifyChildren": true,
 
   // notifyStarted：任务刚开始执行时是否推送一条通知（默认关，避免刷屏）。
+  //   无论开关与否，started 事件都会维护执行生命周期（去重），
+  //   不会影响后续轮次的通知。
   "notifyStarted": false,
+
+  // notifyIdle：session.idle 空闲事件的通知总闸（默认开）。
+  //   关闭后只有 session.execution.* 系列事件会通知；
+  //   开启时仍需对应结果开关（notifySucceeded / notifyFailed /
+  //   notifyInterrupted）同时打开才会发送（二者取交集）。
+  "notifyIdle": true,
+
+  // notifySucceeded：任务成功完成时是否通知。覆盖
+  //   session.execution.succeeded 与 session.idle 的成功结果，
+  //   同一轮执行内过去重只会推送一条。
+  "notifySucceeded": true,
 
   // notifyFailed：任务执行失败时是否通知。
   "notifyFailed": true,
 
+  // notifyInterrupted：任务被中断时是否通知。覆盖
+  //   session.execution.interrupted 与 session.idle 的中断结果，
+  //   同一轮执行内过去重只会推送一条。
+  "notifyInterrupted": true,
+
   // notifyPermission：工具调用需要你授权（批准/拒绝）时是否通知。
   "notifyPermission": true,
+
+  // notifyForm：表单提问（需要你回答问题时）是否通知。
+  "notifyForm": true,
 
   // notifyRetry：请求失败、即将自动重试时是否通知（默认关）。
   "notifyRetry": false,
 
   // debug：是否输出调试日志（[ntfy-debug] 前缀，写入 OpenCode 日志）。
-  //   排障时打开，平时保持关闭。
+  //   关闭时插件完全静默（连缺 topic、配置文件异常也不输出）；
+  //   排障时打开。优先级同其它配置：options > 环境变量 > 本文件 > 默认。
   "debug": false,
 
   // sessionTimeoutMs：单次会话信息查询的超时时间（毫秒）。
@@ -560,7 +692,7 @@ const DEFAULT_CONFIG_FILE_TEMPLATE = `{
 // but the pre-rename .json file sits next to it, seeding a fresh blank
 // template would silently shadow the user's real settings with an empty
 // topic — so we point at the rename instead and create nothing.
-function warnLegacyConfigFile(directory: string): boolean {
+function warnLegacyConfigFile(directory: string, log: DebugLogger): boolean {
   const legacy = join(directory, LEGACY_CONFIG_FILE_NAME)
   let legacyExists = false
   try {
@@ -569,13 +701,7 @@ function warnLegacyConfigFile(directory: string): boolean {
     legacyExists = false
   }
   if (!legacyExists) return false
-  console.error(
-    "[ntfy] Found legacy config file",
-    legacy,
-    "— the config file was renamed to ntfy.local.jsonc; please rename it to",
-    join(directory, CONFIG_FILE_NAME),
-    "to keep using it",
-  )
+  log(`config.file legacy rename hint path=${legacy} -> ${join(directory, CONFIG_FILE_NAME)}`)
   return true
 }
 
@@ -590,18 +716,18 @@ function ensureDefaultConfigFile(path: string, log: DebugLogger): void {
     if (existsSync(path)) return
     const directory = dirname(path)
     mkdirSync(directory, { recursive: true })
-    if (warnLegacyConfigFile(directory)) return
+    if (warnLegacyConfigFile(directory, log)) return
     writeFileSync(path, DEFAULT_CONFIG_FILE_TEMPLATE, "utf-8")
     log(`config.file auto-created path=${path}`)
   } catch (error) {
-    console.error("[ntfy] Failed to create default config file", path, error)
+    log(`config.file create failed path=${path} error=${String(error)}`)
   }
 }
 
 // Reads the external local config file and extracts the whitelisted keys.
 // Never throws: a missing file is a silent skip (debug only), and any read
-// or parse failure logs exactly one line and yields no values, so setup
-// continues with the remaining config sources.
+// or parse failure yields no values (one debug line), so setup continues
+// with the remaining config sources.
 function readConfigFileValues(path: string, log: DebugLogger): Partial<Record<keyof Config, unknown>> {
   let text: string
   try {
@@ -613,7 +739,7 @@ function readConfigFileValues(path: string, log: DebugLogger): Partial<Record<ke
       log(`config.file skipped path=${path} reason=missing`)
       return {}
     }
-    console.error("[ntfy] Failed to read config file", path, error)
+    log(`config.file read failed path=${path} error=${String(error)}`)
     return {}
   }
 
@@ -621,11 +747,11 @@ function readConfigFileValues(path: string, log: DebugLogger): Partial<Record<ke
   try {
     parsed = parseJsonc(text)
   } catch (error) {
-    console.error("[ntfy] Failed to parse config file", path, error)
+    log(`config.file parse failed path=${path} error=${String(error)}`)
     return {}
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    console.error("[ntfy] Config file must contain a JSON object", path)
+    log(`config.file not an object path=${path}`)
     return {}
   }
 
@@ -658,8 +784,12 @@ function readConfig(options: Record<string, unknown>, log: DebugLogger): Config 
     notifyRoot: booleanValue(layered("notifyRoot", "NTFY_NOTIFY_ROOT"), true),
     notifyChildren: booleanValue(layered("notifyChildren", "NTFY_NOTIFY_CHILDREN"), true),
     notifyStarted: booleanValue(layered("notifyStarted", "NTFY_NOTIFY_STARTED"), false),
+    notifyIdle: booleanValue(layered("notifyIdle", "NTFY_NOTIFY_IDLE"), true),
+    notifySucceeded: booleanValue(layered("notifySucceeded", "NTFY_NOTIFY_SUCCEEDED"), true),
     notifyFailed: booleanValue(layered("notifyFailed", "NTFY_NOTIFY_FAILED"), true),
+    notifyInterrupted: booleanValue(layered("notifyInterrupted", "NTFY_NOTIFY_INTERRUPTED"), true),
     notifyPermission: booleanValue(layered("notifyPermission", "NTFY_NOTIFY_PERMISSION"), true),
+    notifyForm: booleanValue(layered("notifyForm", "NTFY_NOTIFY_FORM"), true),
     notifyRetry: booleanValue(layered("notifyRetry", "NTFY_NOTIFY_RETRY"), false),
     debug: booleanValue(layered("debug", "NTFY_DEBUG"), false),
     sessionTimeoutMs: sessionTimeoutValue(layered("sessionTimeoutMs", "NTFY_SESSION_TIMEOUT_MS")),
@@ -748,6 +878,19 @@ function outcomeLabel(outcome: Outcome): { result: string; title: string; tag: s
   }
 }
 
+// session.execution.interrupted carries a machine-readable reason
+// (user | shutdown | superseded | inactivity); map it for the notification
+// body and fall back to the raw value for unknown future reasons.
+function interruptReasonLabel(reason: string | undefined): string {
+  switch (reason) {
+    case "user": return "用户中断"
+    case "shutdown": return "宿主关闭"
+    case "superseded": return "被新任务取代"
+    case "inactivity": return "长时间无活动"
+    default: return stringValue(reason) ?? "未知"
+  }
+}
+
 function toHeaderByteString(value: string): string {
   return Array.from(new TextEncoder().encode(value), (byte) => String.fromCharCode(byte)).join("")
 }
@@ -814,6 +957,7 @@ async function sendNotification(
   tag: string,
   priority: number,
   body: string,
+  log: DebugLogger,
 ): Promise<void> {
   if (!config.topic) return
 
@@ -835,7 +979,11 @@ async function sendNotification(
     })
     if (!response.ok) throw new Error(`ntfy returned HTTP ${response.status}`)
   } catch (error) {
-    console.error("[ntfy] Failed to send notification", error)
+    // A failing ntfy endpoint is operational noise, not a plugin defect:
+    // it must never surface as an error line (a down server would otherwise
+    // print one line per notification and flood the host log) and must never
+    // break the caller. Debug-only, with enough detail to diagnose.
+    log(`send.failed topic=${config.topic} error=${String(error)}`)
   }
 }
 
@@ -843,24 +991,32 @@ export default Plugin.define({
   id: "ntfy",
   setup(ctx) {
     // The debug flag itself can come from the external config file, but the
-    // file reader needs a logger first: bootstrap one from options/env, then
-    // rebuild the final logger from the fully layered config.
-    const bootstrapLog = createDebugLogger(booleanValue(optionOrEnv(ctx.options, "debug", "NTFY_DEBUG"), false))
-    const config = readConfig(ctx.options, bootstrapLog)
+    // file reader needs a logger first. Bootstrap diagnostics are buffered
+    // and replayed through the final logger once the fully layered config
+    // (options > env > file > default) is known — so a file-provided
+    // debug=true still shows config loading, while debug=false everywhere
+    // discards the buffer and the plugin stays completely silent.
+    const bootstrap = createBootstrapLogger()
+    const config = readConfig(ctx.options, bootstrap.log)
     const debugLog = createDebugLogger(config.debug)
-    debugLog("setup")
+    bootstrap.log("setup")
     if (!config.topic) {
-      console.error("[ntfy] No topic configured. Set options.topic or NTFY_TOPIC; notifications are disabled.")
+      // Diagnostic only: without a topic nothing is ever sent, and with
+      // debug=false the plugin must not print anything at all.
+      bootstrap.log("setup.no-topic: notifications disabled (set options.topic or NTFY_TOPIC)")
     }
+    bootstrap.replay(debugLog)
     const location = ctx.location as unknown as LocationLike | undefined
     const sessionTimeoutMs = config.sessionTimeoutMs
 
-    // Bounded dedup sets (see DEDUP_ENTRY_LIMIT): same drop-duplicates
-    // semantics as plain Sets, without unbounded growth.
-    const seenIdleMarkers = createBoundedKeySet()
-    const startedNotified = createBoundedKeySet()
-    const failureNotified = createBoundedKeySet()
-    const successNotified = createBoundedKeySet()
+    // Per-session execution-round state (lifecycle dedup, replaces the old
+    // sessionID-keyed notified sets): the identity of the started event
+    // that opened the current round plus whether this round already
+    // produced a terminal notification. Bounded exactly like the other
+    // dedup stores; evicting a session merely makes its next round look
+    // unopened (one extra notification at worst), never a cross-session
+    // leak. Permission/form/retry dedup stays event-shaped and separate.
+    const executionRounds = createBoundedRoundMap()
     const permissionNotified = createBoundedKeySet()
     const permissionKeyNotified = createBoundedKeySet()
     // Tool-call-precise permission dedup: tool keys already notified, plus
@@ -906,7 +1062,7 @@ export default Plugin.define({
         `会话 ID：${sessionID}`,
       ].join("\n")
 
-      await sendNotification(config, title, config.tag ?? labels.tag, config.priority ?? labels.defaultPriority, body)
+      await sendNotification(config, title, config.tag ?? labels.tag, config.priority ?? labels.defaultPriority, body, debugLog)
     }
 
     const sleepBeforeReconnect = (ms: number): Promise<void> =>
@@ -944,27 +1100,38 @@ export default Plugin.define({
             if (!NOTIFIED_EVENT_TYPES.has(event.type)) continue
             debugLog(`event.type=${event.type}`)
             if (event.type === "session.idle") {
+              // Entry gate, before any IO or state: notifyIdle=false means
+              // session.idle never notifies (execution.* events still do).
+              if (!config.notifyIdle) continue
               const sessionID = event.data.sessionID
+              // Lifecycle dedup: the round's terminal flag merges this idle
+              // with the round's execution completion (either order) and
+              // suppresses re-deliveries, while a newer started event has
+              // already reopened the round for the next task.
+              const round = executionRounds.ensure(sessionID)
+              if (round.terminalNotified) continue
+
               const session = await readSession(ctx, sessionID, sessionTimeoutMs)
               if (!projectMatches(session)) continue
 
               const messages = await readSessionMessages(ctx, sessionID, sessionTimeoutMs)
               const idleMessage = latestIdleMessage(messages)
-              const marker = idleMessage?.id ??
-                (session.time.idle === undefined ? event.id : `${sessionID}:idle:${session.time.idle}`)
-              if (seenIdleMarkers.has(marker)) continue
-              seenIdleMarkers.add(marker)
-
               const isFailed = (session.outcome ?? idleMessage?.outcome) === "failed"
               const outcome = session.outcome ?? idleMessage?.outcome ?? "succeeded"
+              // An idle notification is the INTERSECTION of notifyIdle and
+              // the outcome switch; either one off skips the event without
+              // consuming the round's terminal flag.
               if (isFailed) {
-                if (!config.notifyFailed || failureNotified.has(sessionID)) continue
-              } else if (outcome === "succeeded" && successNotified.has(sessionID)) {
-                continue
+                if (!config.notifyFailed) continue
+              } else if (outcome === "interrupted") {
+                if (!config.notifyInterrupted) continue
+              } else if (outcome === "succeeded") {
+                if (!config.notifySucceeded) continue
               }
               if (!sessionEnabled(session)) continue
-              if (isFailed) failureNotified.add(sessionID)
-              else if (outcome === "succeeded") successNotified.add(sessionID)
+              // Only a notification that is actually sent consumes the
+              // round's terminal state — never a skipped one.
+              round.terminalNotified = true
 
               await notifyCompletion(sessionID, session, messages, outcome)
               continue
@@ -972,42 +1139,59 @@ export default Plugin.define({
 
             if (event.type === "session.execution.succeeded") {
               const sessionID = event.data.sessionID
-              if (successNotified.has(sessionID)) continue
+              const round = executionRounds.ensure(sessionID)
+              if (round.terminalNotified) continue
+              if (!config.notifySucceeded) continue
 
               const session = await readSession(ctx, sessionID, sessionTimeoutMs)
               if (!projectMatches(session) || !sessionEnabled(session)) continue
               const messages = await readSessionMessages(ctx, sessionID, sessionTimeoutMs)
-              successNotified.add(sessionID)
+              round.terminalNotified = true
               await notifyCompletion(sessionID, session, messages, "succeeded")
               continue
             }
 
             if (event.type === "session.execution.started") {
-              if (!config.notifyStarted || startedNotified.has(event.data.sessionID)) continue
-              startedNotified.add(event.data.sessionID)
-              const session = await readSession(ctx, event.data.sessionID, sessionTimeoutMs)
+              const sessionID = event.data.sessionID
+              // Lifecycle bookkeeping runs regardless of notifyStarted: the
+              // round identity is what lets the NEXT execution of the same
+              // session notify again, and a re-delivered started event
+              // (same durable identity) must never reopen a round whose
+              // terminal was already notified. This deliberately sits
+              // before the notifyStarted gate.
+              const round = executionRounds.ensure(sessionID)
+              const key = executionEventKey(event)
+              const isNewRound = key !== undefined && round.startedKey !== key
+              if (!isNewRound) continue
+              round.startedKey = key
+              round.terminalNotified = false
+              if (!config.notifyStarted) continue
+
+              const session = await readSession(ctx, sessionID, sessionTimeoutMs)
               if (!projectMatches(session) || !sessionEnabled(session)) continue
-              const messages = await readSessionMessages(ctx, event.data.sessionID, sessionTimeoutMs)
+              const messages = await readSessionMessages(ctx, sessionID, sessionTimeoutMs)
               const kind = sessionKind(session)
-              const sessionTitle = session.title?.trim() || `未命名会话 ${event.data.sessionID.slice(-8)}`
+              const sessionTitle = session.title?.trim() || `未命名会话 ${sessionID.slice(-8)}`
               const body = [
                 `标题：${sessionTitle}`,
                 `类型：${kind}`,
                 ...projectInfoLines(session, location),
                 `模型：${resolveModel(messages, session.model)}`,
-                `会话 ID：${event.data.sessionID}`,
+                `会话 ID：${sessionID}`,
               ].join("\n")
-              await sendNotification(config, `[opencode] ${kind}·开始`, "arrow_forward", 2, body)
+              await sendNotification(config, `[opencode] ${kind}·开始`, "arrow_forward", 2, body, debugLog)
               continue
             }
 
             if (event.type === "session.execution.failed") {
               const sessionID = event.data.sessionID
-              if (!config.notifyFailed || failureNotified.has(sessionID)) continue
+              const round = executionRounds.ensure(sessionID)
+              if (round.terminalNotified) continue
+              if (!config.notifyFailed) continue
               const session = await readSession(ctx, sessionID, sessionTimeoutMs)
               if (!projectMatches(session) || !sessionEnabled(session)) continue
               const messages = await readSessionMessages(ctx, sessionID, sessionTimeoutMs)
-              failureNotified.add(sessionID)
+              round.terminalNotified = true
               const kind = sessionKind(session)
               const sessionTitle = session.title?.trim() || `未命名会话 ${sessionID.slice(-8)}`
               const body = [
@@ -1021,7 +1205,39 @@ export default Plugin.define({
                 tokenSummary(session.tokens),
                 `会话 ID：${sessionID}`,
               ].join("\n")
-              await sendNotification(config, `[opencode] ${kind}·执行失败`, "x", 5, body)
+              await sendNotification(config, `[opencode] ${kind}·执行失败`, "x", 5, body, debugLog)
+              continue
+            }
+
+            if (event.type === "session.execution.interrupted") {
+              // The protocol's explicit interruption signal
+              // ({sessionID, reason: user|shutdown|superseded|inactivity}).
+              // It is an execution event like succeeded/failed, so it is
+              // gated by notifyInterrupted alone — NOT by notifyIdle — and
+              // merges with an idle interruption of the same round through
+              // the shared terminal flag.
+              const sessionID = event.data.sessionID
+              const round = executionRounds.ensure(sessionID)
+              if (round.terminalNotified) continue
+              if (!config.notifyInterrupted) continue
+              const session = await readSession(ctx, sessionID, sessionTimeoutMs)
+              if (!projectMatches(session) || !sessionEnabled(session)) continue
+              const messages = await readSessionMessages(ctx, sessionID, sessionTimeoutMs)
+              round.terminalNotified = true
+              const kind = sessionKind(session)
+              const sessionTitle = session.title?.trim() || `未命名会话 ${sessionID.slice(-8)}`
+              const body = [
+                `标题：${sessionTitle}`,
+                `类型：${kind}`,
+                ...projectInfoLines(session, location),
+                "结果：中断",
+                `原因：${interruptReasonLabel(event.data.reason)}`,
+                `模型：${resolveModel(messages, session.model)}`,
+                `执行时长：${formatDuration(session.time.created, session.time.idle)}`,
+                tokenSummary(session.tokens),
+                `会话 ID：${sessionID}`,
+              ].join("\n")
+              await sendNotification(config, `[opencode] ${kind}·已中断`, "information_source", 4, body, debugLog)
               continue
             }
 
@@ -1090,7 +1306,7 @@ export default Plugin.define({
                 `模型：${resolveModel(messages, session?.model)}`,
                 `会话 ID：${permission.sessionID}`,
               ].join("\n")
-              await sendNotification(config, `[opencode] ${kind}·需要授权`, "rotating_light", 5, body)
+              await sendNotification(config, `[opencode] ${kind}·需要授权`, "rotating_light", 5, body, debugLog)
               continue
             }
 
@@ -1112,6 +1328,10 @@ export default Plugin.define({
             }
 
             if (event.type === "form.created") {
+              // Independent switch: with notifyForm=false a form must not
+              // send, and must not even consume a dedup slot (so the
+              // switch stays the only gate, before any session IO).
+              if (!config.notifyForm) continue
               // Keep the generated event union's narrowing intact; the local
               // plugin shape describes the runtime form.created payload.
               const formEvent = event as unknown as FormCreatedEventLike
@@ -1170,7 +1390,7 @@ export default Plugin.define({
                 `模型：${resolveModel(messages, session?.model)}`,
                 `会话 ID：${sessionID}`,
               ].join("\n")
-              await sendNotification(config, `[opencode] ${kind}·需要回答问题`, "speech_balloon", 5, body)
+              await sendNotification(config, `[opencode] ${kind}·需要回答问题`, "speech_balloon", 5, body, debugLog)
               continue
             }
 
@@ -1227,7 +1447,7 @@ export default Plugin.define({
                 `模型：${resolveModel(messages, session.model)}`,
                 `会话 ID：${retry.sessionID}`,
               ].join("\n")
-              await sendNotification(config, `[opencode] ${kind}·即将重试`, "hourglass", 3, body)
+              await sendNotification(config, `[opencode] ${kind}·即将重试`, "hourglass", 3, body, debugLog)
             }
           } catch (error) {
             if (error instanceof SessionLookupTimeoutError) {
@@ -1235,7 +1455,11 @@ export default Plugin.define({
               // keep the subscription loop moving; never an error line.
               debugLog(`event skipped: session lookup timed out (type=${event.type})`)
             } else {
-              console.error("[ntfy] Failed to process event", error)
+              // Unexpected per-event failure (malformed payload, host IO):
+              // debug-only, so a host that keeps emitting broken events
+              // cannot flood the log. The loop always keeps moving either
+              // way — this line is diagnostics, never a behavior change.
+              debugLog(`event.failed type=${event.type} error=${String(error)}`)
             }
           }
         }
@@ -1258,7 +1482,7 @@ export default Plugin.define({
         } catch (error) {
           // subscribeOnce already swallows its own failures; this only guards
           // the await machinery itself. Nothing here may reach the host.
-          console.error("[ntfy] Event consumer iteration failed:", error)
+          debugLog(`consumer.iteration failed error=${String(error)}`)
         }
         // Cleanup aborted the controller: exit immediately, never reconnect.
         if (controller.signal.aborted) return
@@ -1271,8 +1495,10 @@ export default Plugin.define({
 
     consumeEvents().catch((error) => {
       // Belt and braces: the consumer must never surface as an unhandled
-      // rejection, which the host may treat as fatal.
-      console.error("[ntfy] Event consumer failed:", error)
+      // rejection, which the host may treat as fatal. It should never get
+      // here (consumeEvents cannot throw); if it ever does, the line is
+      // debug-only so a latent bug cannot flood the host log either.
+      debugLog(`consumer.failed error=${String(error)}`)
     })
     return () => {
       debugLog("cleanup")

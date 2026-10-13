@@ -12,7 +12,11 @@
         "notifyFailed": true,
         "notifyPermission": true,
         "notifyStarted": false,
-        "notifyRetry": false
+        "notifyRetry": false,
+        "notifyIdle": true,
+        "notifySucceeded": true,
+        "notifyInterrupted": true,
+        "notifyForm": true
       }
     }
   ]
